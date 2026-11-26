@@ -7,6 +7,8 @@ on:
       - "feature/**"
       - "fix/**"
       - "ci/**"
+      - pilot/coverage-evidence-20261126-base
+      - pilot/coverage-evidence-20261126-head
 
   pull_request:
     branches:
@@ -49,18 +51,25 @@ jobs:
         run: |
           python -m ruff check app tests
 
-      - name: Run backend tests
-        working-directory: backend
+      - name: Run backend tests with coverage
+        env:
+          PYTHONPATH: backend
         run: |
-          python -m pytest tests -v \
-            --junitxml=pytest-results.xml
+          python -m coverage run -m pytest backend/tests -v \
+            --junitxml=backend/pytest-results.xml
+
+      - name: Export backend coverage
+        if: always()
+        run: python -m coverage json -o backend/coverage.json
 
       - name: Upload backend test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backend-test-results
-          path: backend/pytest-results.xml
+          name: ${{ github.run_attempt == 1 && 'backend-test-results' || format('backend-test-results-{0}-{1}', github.run_id, github.run_attempt) }}
+          path: |
+            backend/pytest-results.xml
+            backend/coverage.json
           if-no-files-found: warn
 
   frontend:
