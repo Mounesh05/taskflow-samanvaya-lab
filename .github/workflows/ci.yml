@@ -9,6 +9,7 @@ on:
       - "ci/**"
       - pilot/coverage-evidence-20261126-base
       - pilot/coverage-evidence-20261126-head
+      - pilot/mixed-quality-ci-20261126
 
   pull_request:
     branches:
@@ -62,14 +63,30 @@ jobs:
         if: always()
         run: python -m coverage json -o backend/coverage.json
 
+      - name: Audit exact installed Python dependencies
+        run: |
+          mkdir -p backend/quality-reports
+          python -m pip freeze > "$RUNNER_TEMP/taskflow-freeze.txt"
+          pipx install pip-audit==2.9.0
+          rc=0
+          pip-audit --disable-pip --no-deps -r "$RUNNER_TEMP/taskflow-freeze.txt" -f json -o backend/quality-reports/pip-audit.json || rc=$?
+          test "$rc" -le 1
+          python - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path(".")
+          inputs = {p: hashlib.sha256((root/p).read_bytes()).hexdigest() for p in
+                    ("backend/requirements.txt", "backend/requirements-dev.txt")}
+          report = {"audit": {"tool": "pip-audit", "inputs": inputs}}
+          (root/"backend/quality-reports/quality-evidence.json").write_text(json.dumps(report))
+          PY
+          cp backend/coverage.json backend/pytest-results.xml backend/quality-reports/
+
       - name: Upload backend test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.run_attempt == 1 && 'backend-test-results' || format('backend-test-results-{0}-{1}', github.run_id, github.run_attempt) }}
-          path: |
-            backend/pytest-results.xml
-            backend/coverage.json
+          path: backend/quality-reports/
           if-no-files-found: warn
 
   frontend:
@@ -94,8 +111,48 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm run test
+      - name: Test with line coverage and JUnit
+        run: |
+          npm install --no-save --ignore-scripts --package-lock=false @vitest/coverage-v8@3.2.7
+          mkdir -p quality-reports
+          npm test -- --coverage --coverage.provider=v8 --coverage.reporter=json-summary --reporter=junit --outputFile=quality-reports/vitest.xml
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const report = JSON.parse(fs.readFileSync('coverage/coverage-summary.json'));
+          const relative = Object.fromEntries(Object.entries(report).map(([file, value]) =>
+            [file === 'total' ? file : path.relative(process.env.GITHUB_WORKSPACE, file), value]));
+          fs.writeFileSync('quality-reports/coverage-summary.json', JSON.stringify(relative));
+          JS
+
 
       - name: Typecheck and build
         run: npm run build
+      - name: Audit locked npm dependencies and record checked TypeScript files
+        run: |
+          rc=0
+          npm audit --json --package-lock-only > quality-reports/npm-audit.json || rc=$?
+          test "$rc" -le 1
+          ./node_modules/.bin/tsc --noEmit --listFiles > "$RUNNER_TEMP/taskflow-checked.txt"
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          current = pathlib.Path.cwd()
+          def inputs(names):
+              return {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in names}
+          files = []
+          for line in (pathlib.Path(os.environ["RUNNER_TEMP"])/"taskflow-checked.txt").read_text().splitlines():
+              path = pathlib.Path(line)
+              if path.is_relative_to(current) and "node_modules" not in path.parts:
+                  files.append(path.relative_to(root).as_posix())
+          report = {"audit": {"tool": "npm-audit", "inputs": inputs(["frontend/package-lock.json", "frontend/package.json"])},
+                    "typecheck": {"tool": "tsc", "exit_code": 0, "inputs": inputs(["frontend/tsconfig.json"]), "files": sorted(files)}}
+          pathlib.Path("quality-reports/quality-evidence.json").write_text(json.dumps(report))
+          PY
+
+      - name: Upload frontend test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: frontend/quality-reports/
+          if-no-files-found: error
